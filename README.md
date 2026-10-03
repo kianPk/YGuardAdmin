@@ -23,7 +23,7 @@ Admins cannot kick or ban each other.
 ## Who is an admin
 
 - **Servers rented from the panel:** the owner, plus whoever the owner adds on the server's page in the panel (Hosting → the server → In-game admins). Bans are stored in the panel too, so the owner can see them and unban there. Changes are pushed over RCON and re-read every `PollSeconds`.
-- **Any other server:** players with the `AdminFlag` CounterStrikeSharp permission (default `@css/ban`) or `@css/root`. Bans go to `configs/plugins/YGuardAdmin/bans.json`.
+- **Any other server:** nothing by default (`HostedOnly: true`), so it never doubles up with CS2-SimpleAdmin or another admin plugin. With `HostedOnly: false`, players with the `AdminFlag` CounterStrikeSharp permission (default `@css/ban`) or `@css/root`. Bans go to `configs/plugins/YGuardAdmin/bans.json`.
 - **Ranked** pods load the plugin idle.
 
 ## Config
@@ -34,6 +34,7 @@ Admins cannot kick or ban each other.
 {
   "ChatPrefix": "YGuard",
   "PollSeconds": 30,
+  "HostedOnly": true,
   "AdminFlag": "@css/ban",
   "DefaultSlapDamage": 0
 }

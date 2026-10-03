@@ -13,6 +13,13 @@ public class YGuardAdminConfig : BasePluginConfig
     public int PollSeconds { get; set; } = 30;
 
     /// <summary>
+    /// When true, the plugin does nothing on servers that are not rented from
+    /// the panel, so it never doubles up with another admin plugin there.
+    /// </summary>
+    [JsonPropertyName("HostedOnly")]
+    public bool HostedOnly { get; set; } = true;
+
+    /// <summary>
     /// Only used on servers that are not rented from the panel: players holding
     /// this CounterStrikeSharp flag (or @css/root) may use the commands.
     /// </summary>

@@ -122,7 +122,8 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
 
     private bool IsBanned(ulong steamId, out BanEntry ban)
     {
-        if (_bans.TryGetValue(steamId, out var found) && found.Active)
+        if ((_hosted || !Config.HostedOnly)
+            && _bans.TryGetValue(steamId, out var found) && found.Active)
         {
             ban = found;
             return true;
@@ -371,7 +372,7 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
 
     private bool Allowed(CCSPlayerController? caller, CommandInfo info)
     {
-        if (!_enabled) return false;
+        if (!_enabled || (!_hosted && Config.HostedOnly)) return false;
         if (IsAdmin(caller)) return true;
         info.ReplyToCommand($"{Prefix} You are not an admin on this server.");
         return false;
