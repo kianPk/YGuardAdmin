@@ -28,6 +28,9 @@ public sealed class ChatAdsState
     [JsonPropertyName("interval_seconds")]
     public int IntervalSeconds { get; set; } = 120;
 
+    [JsonPropertyName("color")]
+    public string Color { get; set; } = "gold";
+
     [JsonPropertyName("messages")]
     public List<string> Messages { get; set; } = [];
 }

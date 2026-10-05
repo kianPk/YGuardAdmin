@@ -21,7 +21,7 @@ namespace YGuardAdmin;
 public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminConfig>
 {
     public override string ModuleName => "YGuard Admin";
-    public override string ModuleVersion => "1.0.2";
+    public override string ModuleVersion => "1.0.3";
     public override string ModuleAuthor => "YGuard";
     public override string ModuleDescription =>
         "slay / slap / kick / ban / bany / respawn, panel admins, timed chat ads";
@@ -38,6 +38,7 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
     private readonly List<string> _chatAds = [];
     private int _chatAdInterval = 120;
     private int _chatAdIndex;
+    private string _chatAdColor = "gold";
     private CounterStrikeSharp.API.Modules.Timers.Timer? _chatAdTimer;
 
     public void OnConfigParsed(YGuardAdminConfig config)
@@ -126,15 +127,17 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
             ? ads!.Messages
                 .Select(m => (m ?? "").Trim())
                 .Where(m => m.Length > 0)
-                .Select(m => m.Length > 180 ? m[..180] : m)
+                .Select(m => m.Length > 220 ? m[..220] : m)
                 .Take(5)
                 .ToList()
             : [];
         var interval = Math.Clamp(ads?.IntervalSeconds ?? 120, 30, 900);
+        var color = NormalizeAdColor(ads?.Color);
 
         var same =
             enabled
             && interval == _chatAdInterval
+            && color == _chatAdColor
             && messages.SequenceEqual(_chatAds);
 
         if (!enabled)
@@ -145,6 +148,7 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
 
         _chatAds.Clear();
         _chatAds.AddRange(messages);
+        _chatAdColor = color;
         if (_chatAdIndex >= _chatAds.Count) _chatAdIndex = 0;
 
         if (same && _chatAdTimer != null) return;
@@ -165,17 +169,70 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
     private void BroadcastNextChatAd()
     {
         if (!_hosted || _chatAds.Count == 0) return;
-        var message = _chatAds[_chatAdIndex % _chatAds.Count];
+        var template = _chatAds[_chatAdIndex % _chatAds.Count];
         _chatAdIndex = (_chatAdIndex + 1) % _chatAds.Count;
         try
         {
+            var accent = AdChatColor(_chatAdColor);
+            var body = ExpandAdPlaceholders(template);
             Server.PrintToChatAll(
-                $" {ChatColors.Gold}[{ChatColors.Default}AD{ChatColors.Gold}]{ChatColors.Default} {message}");
+                $" {accent}[{ChatColors.Default}AD{accent}]{ChatColors.Default} {body}");
         }
         catch
         {
             // ignore chat failures mid-round
         }
+    }
+
+    private static string NormalizeAdColor(string? color)
+    {
+        var key = (color ?? "gold").Trim().ToLowerInvariant();
+        return key switch
+        {
+            "green" or "blue" or "red" or "purple" or "lightred" or "white" or "grey" or "gray" or "gold"
+                => key == "gray" ? "grey" : key,
+            _ => "gold",
+        };
+    }
+
+    private static char AdChatColor(string color) => color switch
+    {
+        "green" => ChatColors.Green,
+        "blue" => ChatColors.Blue,
+        "red" => ChatColors.Red,
+        "purple" => ChatColors.Purple,
+        "lightred" => ChatColors.LightRed,
+        "white" => ChatColors.White,
+        "grey" => ChatColors.Grey,
+        _ => ChatColors.Gold,
+    };
+
+    private string ExpandAdPlaceholders(string template)
+    {
+        var online = OnlinePlayers().ToList();
+        var map = NativeAPI.GetMapName() ?? "";
+        if (string.IsNullOrWhiteSpace(map))
+        {
+            try { map = Server.MapName ?? ""; } catch { map = ""; }
+        }
+
+        var players = online.Count;
+        var maxPlayers = Math.Max(players, Server.MaxPlayers);
+        var randomName = online.Count > 0
+            ? online[Random.Shared.Next(online.Count)].PlayerName
+            : "-";
+        var onlineList = string.Join(", ", online.Select(p => p.PlayerName).Take(8));
+        if (online.Count > 8) onlineList += "…";
+
+        var now = DateTime.Now;
+        return template
+            .Replace("{time}", now.ToString("HH:mm", CultureInfo.InvariantCulture), StringComparison.OrdinalIgnoreCase)
+            .Replace("{date}", now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), StringComparison.OrdinalIgnoreCase)
+            .Replace("{map}", map, StringComparison.OrdinalIgnoreCase)
+            .Replace("{players}", players.ToString(CultureInfo.InvariantCulture), StringComparison.OrdinalIgnoreCase)
+            .Replace("{maxplayers}", maxPlayers.ToString(CultureInfo.InvariantCulture), StringComparison.OrdinalIgnoreCase)
+            .Replace("{player}", randomName, StringComparison.OrdinalIgnoreCase)
+            .Replace("{online}", onlineList, StringComparison.OrdinalIgnoreCase);
     }
 
     private void OnClientAuthorized(int slot, SteamID steamId)
@@ -206,7 +263,8 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
         if (!player.IsValid || player.IsBot) return false;
         if (_hosted)
         {
-            var id = player.AuthorizedSteamID?.SteamId64 ?? 0;
+            // AuthorizedSteamID can still be null briefly after join; SteamID is set earlier.
+            var id = player.AuthorizedSteamID?.SteamId64 ?? player.SteamID;
             return id != 0 && _admins.Contains(id);
         }
         return AdminManager.PlayerHasPermissions(player, Config.AdminFlag)
