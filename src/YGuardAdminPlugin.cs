@@ -21,10 +21,10 @@ namespace YGuardAdmin;
 public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminConfig>
 {
     public override string ModuleName => "YGuard Admin";
-    public override string ModuleVersion => "1.0.0";
+    public override string ModuleVersion => "1.0.2";
     public override string ModuleAuthor => "YGuard";
     public override string ModuleDescription =>
-        "slay / slap / kick / ban / bany / respawn, admins managed from the YGuard panel";
+        "slay / slap / kick / ban / bany / respawn, panel admins, timed chat ads";
 
     public YGuardAdminConfig Config { get; set; } = new();
 
@@ -34,6 +34,11 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
     private bool _hosted;
     private HashSet<ulong> _admins = [];
     private Dictionary<ulong, BanEntry> _bans = [];
+
+    private readonly List<string> _chatAds = [];
+    private int _chatAdInterval = 120;
+    private int _chatAdIndex;
+    private CounterStrikeSharp.API.Modules.Timers.Timer? _chatAdTimer;
 
     public void OnConfigParsed(YGuardAdminConfig config)
     {
@@ -89,6 +94,8 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
                 if (!_hosted)
                 {
                     if (wasHosted) _bans = _localBans?.Load() ?? [];
+                    StopChatAds();
+                    PushLocalBansToPanel();
                     return;
                 }
 
@@ -102,12 +109,73 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
                         b => ulong.Parse(b.SteamId),
                         b => new BanEntry { Reason = b.Reason, ExpiresAt = b.ExpiresAt?.ToUniversalTime() });
 
+                ApplyChatAds(state.ChatAds);
+
                 foreach (var player in OnlinePlayers())
                 {
                     if (IsBanned(player.SteamID, out var ban)) KickBanned(player, ban);
                 }
             });
         });
+    }
+
+    private void ApplyChatAds(ChatAdsState? ads)
+    {
+        var enabled = ads is { Enabled: true } && ads.Messages.Count > 0;
+        var messages = enabled
+            ? ads!.Messages
+                .Select(m => (m ?? "").Trim())
+                .Where(m => m.Length > 0)
+                .Select(m => m.Length > 180 ? m[..180] : m)
+                .Take(5)
+                .ToList()
+            : [];
+        var interval = Math.Clamp(ads?.IntervalSeconds ?? 120, 30, 900);
+
+        var same =
+            enabled
+            && interval == _chatAdInterval
+            && messages.SequenceEqual(_chatAds);
+
+        if (!enabled)
+        {
+            StopChatAds();
+            return;
+        }
+
+        _chatAds.Clear();
+        _chatAds.AddRange(messages);
+        if (_chatAdIndex >= _chatAds.Count) _chatAdIndex = 0;
+
+        if (same && _chatAdTimer != null) return;
+
+        _chatAdInterval = interval;
+        _chatAdTimer?.Kill();
+        _chatAdTimer = AddTimer(_chatAdInterval, BroadcastNextChatAd, TimerFlags.REPEAT);
+    }
+
+    private void StopChatAds()
+    {
+        _chatAdTimer?.Kill();
+        _chatAdTimer = null;
+        _chatAds.Clear();
+        _chatAdIndex = 0;
+    }
+
+    private void BroadcastNextChatAd()
+    {
+        if (!_hosted || _chatAds.Count == 0) return;
+        var message = _chatAds[_chatAdIndex % _chatAds.Count];
+        _chatAdIndex = (_chatAdIndex + 1) % _chatAds.Count;
+        try
+        {
+            Server.PrintToChatAll(
+                $" {ChatColors.Gold}[{ChatColors.Default}AD{ChatColors.Gold}]{ChatColors.Default} {message}");
+        }
+        catch
+        {
+            // ignore chat failures mid-round
+        }
     }
 
     private void OnClientAuthorized(int slot, SteamID steamId)
@@ -296,6 +364,7 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
         {
             var removed = _bans.Remove(steamId);
             _localBans?.Save(_bans);
+            PushLocalBansToPanel();
             info.ReplyToCommand(removed ? $"{Prefix} {steamId} unbanned." : $"{Prefix} {steamId} was not banned.");
             return;
         }
@@ -327,6 +396,16 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
 
     // -------------------------------------------------------------- helpers
 
+    private void PushLocalBansToPanel()
+    {
+        if (!_api.Configured) return;
+        var snapshot = _bans
+            .Where(kv => kv.Value.Active)
+            .Select(kv => (kv.Key, Name: "", kv.Value.Reason, kv.Value.ExpiresAt))
+            .ToList();
+        _ = _api.SyncBansAsync(snapshot);
+    }
+
     private void Ban(CCSPlayerController? caller, CommandInfo info, ulong steamId, string name, int minutes, string reason)
     {
         var duration = minutes > 0 ? FormatMinutes(minutes) : "permanently";
@@ -350,6 +429,7 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
         {
             Apply();
             _localBans?.Save(_bans);
+            PushLocalBansToPanel();
             return;
         }
 

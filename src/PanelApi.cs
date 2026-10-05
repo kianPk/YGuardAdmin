@@ -15,6 +15,21 @@ public sealed class PanelState
 
     [JsonPropertyName("bans")]
     public List<PanelBan> Bans { get; set; } = [];
+
+    [JsonPropertyName("chat_ads")]
+    public ChatAdsState? ChatAds { get; set; }
+}
+
+public sealed class ChatAdsState
+{
+    [JsonPropertyName("enabled")]
+    public bool Enabled { get; set; }
+
+    [JsonPropertyName("interval_seconds")]
+    public int IntervalSeconds { get; set; } = 120;
+
+    [JsonPropertyName("messages")]
+    public List<string> Messages { get; set; } = [];
 }
 
 public sealed class PanelBan
@@ -93,6 +108,25 @@ internal sealed class PanelApi
             ["steam_id"] = steamId.ToString(),
             ["admin_steam_id"] = adminSteamId == 0 ? "" : adminSteamId.ToString(),
         });
+
+    /// <summary>Push the local ban list so the site can show it on Server details.</summary>
+    public async Task SyncBansAsync(
+        IEnumerable<(ulong SteamId, string Name, string Reason, DateTime? ExpiresAt)> bans)
+    {
+        if (!Configured) return;
+        var payload = bans.Select(b => new Dictionary<string, object?>
+        {
+            ["steam_id"] = b.SteamId.ToString(),
+            ["name"] = b.Name,
+            ["reason"] = b.Reason,
+            ["expires_at"] = b.ExpiresAt?.ToUniversalTime().ToString("o"),
+        }).ToList();
+        await PostAsync("/hosted-servers/plugin/server-bans/sync", new Dictionary<string, object?>
+        {
+            ["server_id"] = _serverId,
+            ["bans"] = payload,
+        });
+    }
 
     /// <returns>null on success, otherwise an error message for the admin.</returns>
     private async Task<string?> PostAsync(string path, Dictionary<string, object?> body)
