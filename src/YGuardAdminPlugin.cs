@@ -6,6 +6,7 @@ using CounterStrikeSharp.API.Core.Attributes.Registration;
 using CounterStrikeSharp.API.Modules.Admin;
 using CounterStrikeSharp.API.Modules.Commands;
 using CounterStrikeSharp.API.Modules.Entities;
+using CounterStrikeSharp.API.Modules.Memory;
 using CounterStrikeSharp.API.Modules.Timers;
 using CounterStrikeSharp.API.Modules.Utils;
 using Microsoft.Extensions.Logging;
@@ -14,17 +15,17 @@ namespace YGuardAdmin;
 
 /// <summary>
 /// In-game admin commands for YGuard servers. On a server rented from the panel
-/// the admin and ban lists come from the owner's panel; anywhere else admins
-/// are CounterStrikeSharp flag holders and bans are kept in a local file.
-/// Ranked pods load idle.
+/// the admin and ban lists come from the owner's panel; on match pods, panel
+/// staff (administrator / organizer / moderator) are admins. Elsewhere, with
+/// HostedOnly false, CounterStrikeSharp flag holders can use the commands.
 /// </summary>
 public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminConfig>
 {
     public override string ModuleName => "YGuard Admin";
-    public override string ModuleVersion => "1.0.3";
+    public override string ModuleVersion => "1.1.0";
     public override string ModuleAuthor => "YGuard";
     public override string ModuleDescription =>
-        "slay / slap / kick / ban / bany / respawn, panel admins, timed chat ads";
+        "slay / slap / kick / ban / bany / respawn, player menus, panel admins, timed chat ads, block noclip";
 
     public YGuardAdminConfig Config { get; set; } = new();
 
@@ -32,6 +33,7 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
     private LocalBans? _localBans;
     private bool _enabled;
     private bool _hosted;
+    private bool _blockNoclip;
     private HashSet<ulong> _admins = [];
     private Dictionary<ulong, BanEntry> _bans = [];
 
@@ -40,6 +42,7 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
     private int _chatAdIndex;
     private string _chatAdColor = "gold";
     private CounterStrikeSharp.API.Modules.Timers.Timer? _chatAdTimer;
+    private readonly HashSet<ulong> _noclipWarned = [];
 
     public void OnConfigParsed(YGuardAdminConfig config)
     {
@@ -49,24 +52,89 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
 
     public override void Load(bool hotReload)
     {
-        var serverType = (Environment.GetEnvironmentVariable("SERVER_TYPE") ?? "").Trim();
-        _enabled = !serverType.Equals("Ranked", StringComparison.OrdinalIgnoreCase);
-        if (!_enabled)
-        {
-            Logger.LogInformation("YGuardAdmin idle (SERVER_TYPE={Type})", serverType);
-            return;
-        }
+        // Match (Ranked) pods need admin commands too — do not idle.
+        _enabled = true;
 
         _localBans = new LocalBans(Path.GetFullPath(
             Path.Combine(ModuleDirectory, "..", "..", "configs", "plugins", "YGuardAdmin", "bans.json")));
         _bans = _localBans.Load();
 
+        var serverType = (Environment.GetEnvironmentVariable("SERVER_TYPE") ?? "").Trim();
+        // Practice intentionally allows .noclip / sv_cheats. Everywhere else
+        // regular players must not fly via `bind x noclip` or plugin aliases.
+        _blockNoclip = !serverType.Equals("Practice", StringComparison.OrdinalIgnoreCase);
+
         RegisterListener<Listeners.OnClientAuthorized>(OnClientAuthorized);
-        RegisterListener<Listeners.OnMapStart>(_ => Refresh());
+        RegisterListener<Listeners.OnMapStart>(OnMapStart);
         AddTimer(Config.PollSeconds, Refresh, TimerFlags.REPEAT);
+        HookMenuNumberPicks();
+
+        if (_blockNoclip)
+        {
+            AddCommandListener("noclip", OnNoclipCommand, HookMode.Pre);
+            AddCommandListener("css_noclip", OnNoclipCommand, HookMode.Pre);
+            // Re-assert walk + sv_cheats 0; SimpleAdmin can flip MoveType without cheats.
+            AddTimer(0.25f, StripUnauthorizedNoclip, TimerFlags.REPEAT);
+            AddTimer(30f, LockCheatsOff, TimerFlags.REPEAT);
+            LockCheatsOff();
+        }
+
         Refresh();
 
-        Logger.LogInformation("YGuardAdmin active (SERVER_TYPE={Type})", serverType);
+        Logger.LogInformation(
+            "YGuardAdmin active (SERVER_TYPE={Type}, blockNoclip={Block})",
+            serverType,
+            _blockNoclip);
+    }
+
+    private void OnMapStart(string mapName)
+    {
+        _noclipWarned.Clear();
+        Refresh();
+        if (_blockNoclip) LockCheatsOff();
+    }
+
+    private void LockCheatsOff()
+    {
+        if (!_blockNoclip) return;
+        Server.ExecuteCommand("sv_cheats 0");
+    }
+
+    private HookResult OnNoclipCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (!_blockNoclip) return HookResult.Continue;
+        if (player == null || !player.IsValid || player.IsBot) return HookResult.Continue;
+        if (IsAdmin(player)) return HookResult.Continue;
+        Reply(player, "Noclip is disabled for players on this server.");
+        return HookResult.Stop;
+    }
+
+    private void StripUnauthorizedNoclip()
+    {
+        if (!_blockNoclip) return;
+
+        foreach (var player in OnlinePlayers())
+        {
+            if (IsAdmin(player)) continue;
+            var pawn = player.PlayerPawn.Value;
+            if (pawn == null || !pawn.IsValid) continue;
+            if (pawn.MoveType != MoveType_t.MOVETYPE_NOCLIP) continue;
+
+            SetMoveType(pawn, MoveType_t.MOVETYPE_WALK);
+
+            if (_noclipWarned.Add(player.SteamID))
+            {
+                Reply(player, "Noclip is disabled for players on this server.");
+            }
+        }
+    }
+
+    private static void SetMoveType(CCSPlayerPawn pawn, MoveType_t moveType)
+    {
+        pawn.MoveType = moveType;
+        // m_MoveType alone is cosmetic; the engine reads m_nActualMoveType.
+        Schema.SetSchemaValue(pawn.Handle, "CBaseEntity", "m_nActualMoveType", (byte)moveType);
+        Utilities.SetStateChanged(pawn, "CBaseEntity", "m_MoveType");
     }
 
     // ---------------------------------------------------------------- state
@@ -92,6 +160,15 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
             {
                 var wasHosted = _hosted;
                 _hosted = state.Hosted;
+                _admins = state.Admins
+                    .Select(id => ulong.TryParse(id, out var v) ? v : 0)
+                    .Where(v => v != 0)
+                    .ToHashSet();
+                Logger.LogInformation(
+                    "state ok hosted={Hosted} admins={Count}",
+                    _hosted,
+                    _admins.Count);
+
                 if (!_hosted)
                 {
                     if (wasHosted) _bans = _localBans?.Load() ?? [];
@@ -100,10 +177,6 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
                     return;
                 }
 
-                _admins = state.Admins
-                    .Select(id => ulong.TryParse(id, out var v) ? v : 0)
-                    .Where(v => v != 0)
-                    .ToHashSet();
                 _bans = state.Bans
                     .Where(b => ulong.TryParse(b.SteamId, out _))
                     .ToDictionary(
@@ -155,6 +228,8 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
 
         _chatAdInterval = interval;
         _chatAdTimer?.Kill();
+        // Fire once now, then keep rotating on the interval (CSS timers wait first tick).
+        BroadcastNextChatAd();
         _chatAdTimer = AddTimer(_chatAdInterval, BroadcastNextChatAd, TimerFlags.REPEAT);
     }
 
@@ -175,8 +250,9 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
         {
             var accent = AdChatColor(_chatAdColor);
             var body = ExpandAdPlaceholders(template);
+            // Colour applies to the message body (what the admin typed), not only [AD].
             Server.PrintToChatAll(
-                $" {accent}[{ChatColors.Default}AD{accent}]{ChatColors.Default} {body}");
+                $" {accent}[{ChatColors.Default}AD{accent}] {accent}{body}");
         }
         catch
         {
@@ -261,19 +337,19 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
     {
         if (player == null) return true;
         if (!player.IsValid || player.IsBot) return false;
-        if (_hosted)
-        {
-            // AuthorizedSteamID can still be null briefly after join; SteamID is set earlier.
-            var id = player.AuthorizedSteamID?.SteamId64 ?? player.SteamID;
-            return id != 0 && _admins.Contains(id);
-        }
+        // AuthorizedSteamID can still be null briefly after join; SteamID is set earlier.
+        var id = player.AuthorizedSteamID?.SteamId64 ?? player.SteamID;
+        if (id != 0 && _admins.Contains(id)) return true;
+        if (_hosted) return false;
+        if (Config.HostedOnly) return false;
         return AdminManager.PlayerHasPermissions(player, Config.AdminFlag)
                || AdminManager.PlayerHasPermissions(player, "@css/root");
     }
 
     private bool IsAdminSteam(ulong steamId)
     {
-        if (_hosted) return _admins.Contains(steamId);
+        if (steamId != 0 && _admins.Contains(steamId)) return true;
+        if (_hosted || Config.HostedOnly) return false;
         var online = OnlinePlayers().FirstOrDefault(p => p.SteamID == steamId);
         return online != null && IsAdmin(online);
     }
@@ -282,40 +358,52 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
 
     [ConsoleCommand("css_admin", "List YGuard admin commands")]
     [ConsoleCommand("css_admins", "List YGuard admin commands")]
+    [CommandHelper(whoCanExecute: CommandUsage.CLIENT_AND_SERVER)]
     public void CmdHelp(CCSPlayerController? caller, CommandInfo info)
     {
         if (!Allowed(caller, info)) return;
-        info.ReplyToCommand($"{Prefix} !slay <target> · !slap <target> [damage] · !kick <target> [reason]");
-        info.ReplyToCommand($"{Prefix} !ban <target|steamid64> [time: 30m 2h 7d, 0 = permanent] [reason]");
-        info.ReplyToCommand($"{Prefix} !bany <steamid64> (unban) · !respawn <target>");
-        info.ReplyToCommand($"{Prefix} targets: name, #userid, @all, @t, @ct, @me");
+        if (caller is { IsValid: true })
+        {
+            OpenAdminRootMenu(caller);
+            return;
+        }
+        Reply(caller, "!slay / !slap / !kick / !ban / !respawn — open a player menu (or pass a target)");
+        Reply(caller, "!bany <steamid64> · targets: name, #userid, @all, @t, @ct, @me");
     }
 
     [ConsoleCommand("css_slay", "Kill a player")]
-    [CommandHelper(minArgs: 1, usage: "<target>")]
+    [CommandHelper(usage: "[target]")]
     public void CmdSlay(CCSPlayerController? caller, CommandInfo info)
     {
         if (!Allowed(caller, info)) return;
+        if (caller is { IsValid: true } && WantsPlayerMenu(info))
+        {
+            OpenPlayerMenu(caller, AdminAction.Slay);
+            return;
+        }
         foreach (var target in Targets(caller, info))
         {
-            var pawn = target.PlayerPawn.Value;
-            if (pawn == null || !pawn.IsValid || pawn.LifeState != (byte)LifeState_t.LIFE_ALIVE) continue;
-            pawn.CommitSuicide(false, true);
-            Announce($"{AdminName(caller)} slayed {ChatColors.Red}{target.PlayerName}");
+            ApplyAction(caller, target, AdminAction.Slay);
         }
     }
 
     [ConsoleCommand("css_slap", "Slap a player")]
-    [CommandHelper(minArgs: 1, usage: "<target> [damage]")]
+    [CommandHelper(usage: "[target] [damage]")]
     public void CmdSlap(CCSPlayerController? caller, CommandInfo info)
     {
         if (!Allowed(caller, info)) return;
+        if (caller is { IsValid: true } && WantsPlayerMenu(info))
+        {
+            OpenPlayerMenu(caller, AdminAction.Slap);
+            return;
+        }
         var damage = Config.DefaultSlapDamage;
         if (info.ArgCount > 2 && int.TryParse(info.GetArg(2), out var parsed)) damage = parsed;
         damage = Math.Clamp(damage, 0, 500);
 
         foreach (var target in Targets(caller, info))
         {
+            if (!CanPunish(caller, info, target)) continue;
             var pawn = target.PlayerPawn.Value;
             if (pawn == null || !pawn.IsValid || pawn.LifeState != (byte)LifeState_t.LIFE_ALIVE) continue;
 
@@ -337,23 +425,29 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
     }
 
     [ConsoleCommand("css_respawn", "Respawn a player")]
-    [CommandHelper(minArgs: 1, usage: "<target>")]
+    [CommandHelper(usage: "[target]")]
     public void CmdRespawn(CCSPlayerController? caller, CommandInfo info)
     {
         if (!Allowed(caller, info)) return;
-        foreach (var target in Targets(caller, info))
+        if (caller is { IsValid: true } && WantsPlayerMenu(info))
         {
-            if (target.Team is not (CsTeam.Terrorist or CsTeam.CounterTerrorist)) continue;
-            target.Respawn();
-            Announce($"{AdminName(caller)} respawned {ChatColors.Green}{target.PlayerName}");
+            OpenPlayerMenu(caller, AdminAction.Respawn);
+            return;
         }
+        foreach (var target in Targets(caller, info))
+            ApplyAction(caller, target, AdminAction.Respawn);
     }
 
     [ConsoleCommand("css_kick", "Kick a player")]
-    [CommandHelper(minArgs: 1, usage: "<target> [reason]")]
+    [CommandHelper(usage: "[target] [reason]")]
     public void CmdKick(CCSPlayerController? caller, CommandInfo info)
     {
         if (!Allowed(caller, info)) return;
+        if (caller is { IsValid: true } && WantsPlayerMenu(info))
+        {
+            OpenPlayerMenu(caller, AdminAction.Kick);
+            return;
+        }
         var reason = JoinArgs(info, 2);
         foreach (var target in Targets(caller, info))
         {
@@ -365,10 +459,15 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
     }
 
     [ConsoleCommand("css_ban", "Ban a player")]
-    [CommandHelper(minArgs: 1, usage: "<target|steamid64> [time] [reason]")]
+    [CommandHelper(usage: "[target|steamid64] [time] [reason]")]
     public void CmdBan(CCSPlayerController? caller, CommandInfo info)
     {
         if (!Allowed(caller, info)) return;
+        if (caller is { IsValid: true } && WantsPlayerMenu(info))
+        {
+            OpenPlayerMenu(caller, AdminAction.Ban);
+            return;
+        }
 
         var minutes = 0;
         var reasonFrom = 2;
@@ -386,21 +485,21 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
             var online = OnlinePlayers().FirstOrDefault(p => p.SteamID == steamId);
             if (online != null)
             {
-                if (CanPunish(caller, info, online)) Ban(caller, info, steamId, online.PlayerName, minutes, reason);
+                if (CanPunish(caller, info, online)) Ban(caller, steamId, online.PlayerName, minutes, reason);
                 return;
             }
             if (caller != null && IsAdminSteam(steamId))
             {
-                info.ReplyToCommand($"{Prefix} You cannot ban another admin.");
+                Reply(caller, "You cannot ban another admin.");
                 return;
             }
-            Ban(caller, info, steamId, "", minutes, reason);
+            Ban(caller, steamId, "", minutes, reason);
             return;
         }
 
         foreach (var target in Targets(caller, info))
         {
-            if (CanPunish(caller, info, target)) Ban(caller, info, target.SteamID, target.PlayerName, minutes, reason);
+            if (CanPunish(caller, info, target)) Ban(caller, target.SteamID, target.PlayerName, minutes, reason);
         }
     }
 
@@ -413,7 +512,7 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
         var arg = info.GetArg(1).Trim();
         if (!SteamIdPattern().IsMatch(arg))
         {
-            info.ReplyToCommand($"{Prefix} Usage: !bany <steamid64>");
+            Reply(caller, "Usage: !bany <steamid64>");
             return;
         }
         var steamId = ulong.Parse(arg, CultureInfo.InvariantCulture);
@@ -423,7 +522,7 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
             var removed = _bans.Remove(steamId);
             _localBans?.Save(_bans);
             PushLocalBansToPanel();
-            info.ReplyToCommand(removed ? $"{Prefix} {steamId} unbanned." : $"{Prefix} {steamId} was not banned.");
+            Reply(caller, removed ? $"{steamId} unbanned." : $"{steamId} was not banned.");
             return;
         }
 
@@ -464,7 +563,7 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
         _ = _api.SyncBansAsync(snapshot);
     }
 
-    private void Ban(CCSPlayerController? caller, CommandInfo info, ulong steamId, string name, int minutes, string reason)
+    private void Ban(CCSPlayerController? caller, ulong steamId, string name, int minutes, string reason)
     {
         var duration = minutes > 0 ? FormatMinutes(minutes) : "permanently";
         var entry = new BanEntry
@@ -510,16 +609,23 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
 
     private bool Allowed(CCSPlayerController? caller, CommandInfo info)
     {
-        if (!_enabled || (!_hosted && Config.HostedOnly)) return false;
+        if (!_enabled) return false;
         if (IsAdmin(caller)) return true;
-        info.ReplyToCommand($"{Prefix} You are not an admin on this server.");
+        var id = caller?.AuthorizedSteamID?.SteamId64 ?? caller?.SteamID ?? 0;
+        Logger.LogInformation(
+            "denied admin cmd for {Name} steam={Steam} hosted={Hosted} admins={Count}",
+            caller?.PlayerName ?? "console",
+            id,
+            _hosted,
+            _admins.Count);
+        Reply(caller, "You are not an admin on this server.");
         return false;
     }
 
     private bool CanPunish(CCSPlayerController? caller, CommandInfo info, CCSPlayerController target)
     {
         if (caller == null || target.SteamID == caller.SteamID || !IsAdmin(target)) return true;
-        info.ReplyToCommand($"{Prefix} {target.PlayerName} is an admin.");
+        Reply(caller, $"{target.PlayerName} is an admin.");
         return false;
     }
 
@@ -528,7 +634,7 @@ public partial class YGuardAdminPlugin : BasePlugin, IPluginConfig<YGuardAdminCo
         var players = info.GetArgTargetResult(1).Players
             .Where(p => p is { IsValid: true, IsHLTV: false })
             .ToList();
-        if (players.Count == 0) info.ReplyToCommand($"{Prefix} No player matches \"{info.GetArg(1)}\".");
+        if (players.Count == 0) Reply(caller, $"No player matches \"{info.GetArg(1)}\".");
         return players;
     }
 
